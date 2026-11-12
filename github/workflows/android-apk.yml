@@ -1,0 +1,92 @@
+# Android APK 云构建（无需任何 secrets）
+# 用法：commit 到 fork 的 .github/workflows/ 下 → Actions 页手动 Run workflow → 运行完下载 artifact "android-apk"
+name: Android APK (no secrets)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android arm64 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2.9.3
+        continue-on-error: true
+        with:
+          workspaces: src-tauri -> target
+          key: android
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK（arm64，未签名）
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: 现场生成 keystore 并签名
+        run: |
+          set -euo pipefail
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          KS="$RUNNER_TEMP/hghub.keystore"
+          keytool -genkeypair -v \
+            -keystore "$KS" -storepass hghub123456 -keypass hghub123456 \
+            -alias hghub -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=HGhub, OU=Personal, O=HGhub, L=Internet, ST=Internet, C=CN"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          mkdir -p artifacts
+          found=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk'); do
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            out="artifacts/HGhub_${V}_${abi}.apk"
+            "$APKSIGNER" sign --ks "$KS" --ks-key-alias hghub \
+              --ks-pass pass:hghub123456 --key-pass pass:hghub123456 \
+              --v4-signing-enabled false --out "$out" "$f"
+            "$APKSIGNER" verify --print-certs "$out" | head -3
+            found=$((found+1))
+          done
+          rm -f "$KS"
+          if [ "$found" -eq 0 ]; then echo "::error::没有找到 release APK"; exit 1; fi
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: artifacts/*
+          if-no-files-found: error
